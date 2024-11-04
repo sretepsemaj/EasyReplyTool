@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rewrite Results</title>
+</head>
+<body>
+    <h1>Comments Summary</h1>
+
+    {% if error %}
+        <p>{{ error }}</p>
+    {% else %}
+        <h2>Original Comments</h2>
+        <ul>
+            {% for comment in original_comments %}
+                <li>{{ comment }}</li>
+            {% endfor %}
+        </ul>
+
+        <h2>Cohesive Summary</h2>
+        <p>{{ cohesive_comment }}</p>
+    {% endif %}
+</body>
+</html>

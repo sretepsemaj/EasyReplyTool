@@ -1,19 +1,22 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template
 import requests
 import os
 from dotenv import load_dotenv
 from groq import Groq
+import re
+from transformers import GPT2TokenizerFast
 
 app = Flask(__name__)
 
-# Load environment variables from .env file
-load_dotenv()
+load_dotenv() # Load environment variables from .env file
 
-# Get the YouTube API key from environment variables
+tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 YOUTUBE_API_KEY = os.getenv("TUBE_API_KEY")
 YOUTUBE_COMMENTS_URL = "https://www.googleapis.com/youtube/v3/commentThreads"
+GROQ_TOKEN_LIMIT = 4096
 
 @app.route('/video_details', methods=['GET'])
 def get_video_details():
@@ -151,76 +154,148 @@ def oauth2callback():
     # Here, you will handle the authorization code that Google sends back
     return "OAuth flow completed"
 
-def fetch_single_comment_text(video_id):
-    """Fetch a single top-level comment from a YouTube video."""
-    params = {
-        'key': YOUTUBE_API_KEY,
-        'part': 'snippet',
-        'videoId': video_id,
-        'maxResults': 1  # Limit to 1 comment
+def calculate_total_tokens(comments):
+    """Calculate the approximate total token count for a list of comments."""
+    combined_text = " ".join(comments)
+    tokenized_text = tokenizer.encode(combined_text)
+    return len(tokenized_text)
+
+# Example usage
+comments_text = ["This is a comment.", "Here's another comment!"]
+total_tokens = calculate_total_tokens(comments_text)
+print(f"Total tokens: {total_tokens}")
+
+
+def fetch_multiple_comments_text(video_id, max_comments=60):
+    """Fetch up to 60 top-level comments from a YouTube video."""
+    comments_text = []
+    page_token = None
+    while len(comments_text) < max_comments:
+        params = {
+            'key': YOUTUBE_API_KEY,
+            'part': 'snippet',
+            'videoId': video_id,
+            'maxResults': min(50, max_comments - len(comments_text)),  # Get up to 50 comments per request, within max limit
+            'pageToken': page_token
+        }
+
+        response = requests.get(YOUTUBE_COMMENTS_URL, params=params)
+        if response.status_code != 200:
+            return None
+
+        data = response.json()
+        for item in data.get('items', []):
+            comment_text = item["snippet"]["topLevelComment"]["snippet"]["textDisplay"]
+
+            # Skip entries with links or metadata patterns
+            if "<a href=" in comment_text or len(comment_text) > 500:
+                continue
+            
+            # Clean up the comment
+            cleaned_comment_text = clean_comment_text(comment_text)
+            comments_text.append(cleaned_comment_text)
+
+            if len(comments_text) >= max_comments:
+                break
+
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+    return comments_text[:max_comments]  # Return up to the number of requested comments
+
+def clean_comment_text(comment):
+    """Clean up each comment by removing extra newlines and whitespace."""
+    cleaned_comment = re.sub(r'\s+', ' ', comment).strip()
+    return cleaned_comment
+
+def calculate_total_tokens(comments_text):
+    """Calculate the total token count for the combined comments."""
+    combined_text = " ".join(comments_text)
+    tokenized_text = tokenizer.encode(combined_text)
+    return len(tokenized_text)
+
+def rewrite_combined_comments(comments_text):
+    """Rewrite comments into a single cohesive summary, chunking if necessary."""
+    total_tokens = calculate_total_tokens(comments_text)
+
+    # Check if total tokens exceed the model's token limit (1024 tokens)
+    if total_tokens <= 1024:
+        # If within token limit, send all comments as one request
+        return process_with_groq(comments_text)
+    else:
+        # If over the limit, chunk comments and process each chunk separately
+        chunked_responses = []
+        chunk = []
+        chunk_tokens = 0
+
+        for comment in comments_text:
+            comment_tokens = len(tokenizer.encode(comment))
+            if chunk_tokens + comment_tokens > 1024:
+                # Process the current chunk and start a new one
+                chunked_responses.append(process_with_groq(chunk))
+                chunk = []
+                chunk_tokens = 0
+
+            chunk.append(comment)
+            chunk_tokens += comment_tokens
+
+        # Process the final chunk
+        if chunk:
+            chunked_responses.append(process_with_groq(chunk))
+
+        # Combine chunked responses into a final summary
+        combined_summary = " ".join(chunked_responses)
+        return combined_summary
+
+def process_with_groq(comments_chunk):
+    """Send a chunk of comments to Groq API and return the cohesive summary."""
+    system_message = {
+        "role": "system",
+        "content": (
+            "Take all these comment and write a short paragraph to replect the information. "
+            "combine everything and make it overall view of the sentiment"
+        )
     }
 
-    response = requests.get(YOUTUBE_COMMENTS_URL, params=params)
-    if response.status_code != 200:
-        return None
-
-    data = response.json()
-    # Extract the text of the first comment, if available
-    if data.get('items'):
-        comment_text = data['items'][0]["snippet"]["topLevelComment"]["snippet"]["textDisplay"]
-        return comment_text
-    else:
-        return None
-
-def rewrite_comment(comment_text):
-    """Send a single comment to Groq API to generate a rewritten or expanded version."""
-    if not comment_text:
-        return "No comment available to rewrite."
+    # Create user messages for each comment
+    user_messages = [{"role": "user", "content": f"Comment #{i+1}:\n{comment}"} for i, comment in enumerate(comments_chunk)]
+    messages = [system_message] + user_messages
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
 
+    # Send the payload with a slightly higher max_tokens if necessary for more data
     payload = {
-        "model": "llama3-8b-8192",  # Using the specified model
-        "messages": [{"role": "user", "content": comment_text}],  # Sending 'messages' format
-        "max_tokens": 150  # Adjust as needed
+        "model": "llama3-8b-8192",
+        "messages": messages,
+        "max_tokens": 4096  # Adjust this if Groq can handle more tokens
     }
 
-    try:
-        response = requests.post(GROQ_API_URL, json=payload, headers=headers)
-        
-        if response.status_code == 200:
-            # Extract the rewritten comment text correctly
-            full_response = response.json()
-            print("Full response from Groq API:", full_response)  # For debugging purposes
-            
-            # Extract the content from 'message'
-            rewritten_text = full_response.get("choices", [{}])[0].get("message", {}).get("content", "Rewrite was successful, but no content was returned.")
-            return rewritten_text.strip()
-        else:
-            # Print the full error response for debugging
-            print("Error response:", response.json())
-            return f"Failed to rewrite comment: {response.status_code} - {response.json()}"
-    except Exception as e:
-        return f"Failed to rewrite comment: {str(e)}"
+    # Make the request and handle the response
+    response = requests.post(GROQ_API_URL, json=payload, headers=headers)
+    if response.status_code == 200:
+        return response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    else:
+        return f"Error processing with Groq: {response.status_code} - {response.text}"
 
-
-@app.route('/rewrite', methods=['GET'])
-def get_rewrite():
+@app.route('/display', methods=['GET'])
+def display_rewrite():
     video_id = request.args.get('video_id')
     if not video_id:
-        return jsonify({"error": "Please provide a video ID"}), 400
+        return render_template("result.html", error="Please provide a video ID")
 
-    # Fetch a single comment from the video
-    comment_text = fetch_single_comment_text(video_id)
-    if comment_text is None:
-        return jsonify({"error": "Failed to fetch comment"}), 500
+    # Fetch comments and process them
+    comments_text = fetch_multiple_comments_text(video_id)
+    if comments_text is None:
+        return render_template("result.html", error="Failed to fetch comments")
 
-    # Rewrite the comment using Groq API
-    rewritten_comment = rewrite_comment(comment_text)
-    return jsonify({"original_comment": comment_text, "rewritten_comment": rewritten_comment})
+    cohesive_comment = rewrite_combined_comments(comments_text)
+    
+    # Render the output to an HTML template
+    return render_template("result.html", original_comments=comments_text, cohesive_comment=cohesive_comment)
 
 if __name__ == '__main__':
     app.run(debug=True)
