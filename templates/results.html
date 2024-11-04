@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Search Results</title>
+</head>
+<body>
+    <h1>Search Results</h1>
+    {% if videos %}
+        <ul>
+            {% for video in videos %}
+                <li>
+                    <a href="https://www.youtube.com/watch?v={{ video.id.videoId }}" target="_blank">
+                        {{ video.snippet.title }}
+                    </a>
+                    <p>{{ video.snippet.description }}</p>
+                    <img src="{{ video.snippet.thumbnails.default.url }}" alt="Thumbnail">
+                </li>
+            {% endfor %}
+        </ul>
+    {% else %}
+        <p>No results found.</p>
+    {% endif %}
+    <a href="/search">Back to Search</a>
+</body>
+</html>
